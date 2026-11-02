@@ -6,6 +6,7 @@ import "dotenv/config"
 const PORT = 5000;
 
 const app = express();
+app.use(cors(["http://localhost:3000"]));
 app.use(express.json());
 
 
@@ -23,16 +24,18 @@ export async function connectToMongoDB() {
 }
 const connectedClient = await connectToMongoDB()
 const db = connectedClient.db("creativo");
-const facilitiesCollection = db.collection("facilities")
+const facilitiesCollection = db.collection("studio")
 
-app.post("facilities", async (req,res)=>{
+app.post("/studio", async (req,res)=>{
     // Step-1: Retrive the data form the request body
     const facilityData = req.body;
+
+    //Step-2: Insert The data into the mongodb collection
     const result = await facilitiesCollection.insertOne(facilityData)
-    result = res.send(result)
+    res.send(result)
 })
 
-app.get("/facilities", async (req, res)=>{
+app.get("/studio", async (req, res)=>{
     const result = await facilitiesCollection.find().toArray();
     res.send(result)
 
