@@ -24,21 +24,34 @@ export async function connectToMongoDB() {
 }
 const connectedClient = await connectToMongoDB()
 const db = connectedClient.db("creativo");
-const facilitiesCollection = db.collection("studio")
+const studiosCollection = db.collection("studio")
+const studiosBookingCollection = db.collection("studio")
 
 app.post("/studio", async (req,res)=>{
     // Step-1: Retrive the data form the request body
     const facilityData = req.body;
 
     //Step-2: Insert The data into the mongodb collection
-    const result = await facilitiesCollection.insertOne(facilityData)
+    const result = await studiosCollection.insertOne(facilityData)
     res.send(result)
 })
 
 app.get("/studio", async (req, res)=>{
-    const result = await facilitiesCollection.find().toArray();
+    const result = await studiosCollection.find().toArray();
     res.send(result)
+})
 
+app.get("/studio/:id", async (req, res)=>{
+    const id = req.params.id;
+    const result = await studiosCollection.findOne({id: id});
+    res.send(result)
+})
+
+app.post("/studio/booking", async (req, res)=>{
+  const bookingData = req.body;
+  console.log(req.body, "booking data")
+  const result = await studiosBookingCollection.insertOne(bookingData);
+  res.send(result);
 })
 
 app.get("/", (req, res)=>{
