@@ -62,9 +62,6 @@ function validateStudio(body) {
   } else if (!body.amenities.every((i) => typeof i === "string")) {
     errors.amenities = "amenities must be an array of strings.";
   }
-  if (typeof body?.hostEmail === "string" && body.hostEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.hostEmail)) {
-    errors.hostEmail = "hostEmail must be a valid email address.";
-  }
   return errors;
 }
 
@@ -89,6 +86,15 @@ app.post("/studio", async (req, res) => {
   }
   try {
     const studio = normalizeStudio(req.body);
+    
+    // 👇 নিশ্চিত করা হলো যে ownerEmail বা hostEmail যেকোনো একটি সেভ হবে
+    if (!studio.ownerEmail && studio.hostEmail) {
+      studio.ownerEmail = studio.hostEmail;
+    }
+    if (!studio.hostEmail && studio.ownerEmail) {
+      studio.hostEmail = studio.ownerEmail;
+    }
+
     const result = await studiosCollection.insertOne(studio);
     res.status(201).json({
       message: "Studio created successfully.",
@@ -103,7 +109,15 @@ app.post("/studio", async (req, res) => {
 
 app.get("/studio", async (req, res) => {
   try {
-    const result = await studiosCollection.find().toArray();
+    const { ownerEmail } = req.query;
+    const query = {};
+    
+    // 👇 ownerEmail থাকলে সেই অনুযায়ী ফিল্টার করবে
+    if (typeof ownerEmail === "string" && ownerEmail.trim() !== "") {
+      query.$or = [{ ownerEmail }, { hostEmail: ownerEmail }];
+    }
+    
+    const result = await studiosCollection.find(query).toArray();
     res.json(result);
   } catch (error) {
     res.status(500).json({ message: "Failed to load studios.", error: error.message });
@@ -121,6 +135,73 @@ app.get("/studio/:id", async (req, res) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ message: "Failed to load studio.", error: error.message });
+  }
+});
+
+const STUDIO_UPDATABLE_FIELDS = [
+  "title", "category", "location", "overview",
+  "hourlyRate", "securityDeposit", "maxCapacity", "imageUrl",
+  "amenities", "hostName", "hostEmail", "ownerEmail",
+];
+
+app.patch("/studio/:id", async (req, res) => {
+  const { id } = req.params;
+  const body = req.body ?? {};
+  const query = ObjectId.isValid(id)
+    ? { $or: [{ _id: new ObjectId(id) }, { id }] }
+    : { id };
+
+  try {
+    const existing = await studiosCollection.findOne(query);
+    if (!existing) return res.status(404).json({ message: "Studio not found." });
+
+    const merged = { ...existing, ...body };
+    const errors = validateStudio(merged);
+    if (Object.keys(errors).length > 0) {
+      return res.status(400).json({
+        message: `Invalid studio data: ${Object.values(errors).join(" ")}`,
+        errors,
+      });
+    }
+
+    const updates = { updatedAt: new Date() };
+    for (const field of STUDIO_UPDATABLE_FIELDS) {
+      if (body[field] !== undefined) {
+        updates[field] = body[field];
+      }
+    }
+    for (const field of STUDIO_NUMERIC_FIELDS) {
+      if (updates[field] !== undefined) {
+        updates[field] = Number(updates[field]);
+      }
+    }
+
+    const result = await studiosCollection.findOneAndUpdate(
+      query,
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+    if (!result) return res.status(404).json({ message: "Studio not found." });
+    res.json({ message: "Studio updated successfully.", studio: result });
+  } catch (error) {
+    console.error("PATCH /studio/:id failed:", error);
+    res.status(500).json({ message: "Failed to update studio.", error: error.message });
+  }
+});
+
+app.delete("/studio/:id", async (req, res) => {
+  const { id } = req.params;
+  const query = ObjectId.isValid(id)
+    ? { $or: [{ _id: new ObjectId(id) }, { id }] }
+    : { id };
+
+  try {
+    const result = await studiosCollection.findOneAndDelete(query);
+    if (!result) return res.status(404).json({ message: "Studio not found." });
+    res.json({ message: "Studio deleted successfully.", deletedId: id });
+  } catch (error) {
+    console.error("DELETE /studio/:id failed:", error);
+    res.status(500).json({ message: "Failed to delete studio.", error: error.message });
   }
 });
 
@@ -173,6 +254,7 @@ app.post("/booking", async (req, res) => {
 
     const booking = {
       ...req.body,
+      userEmail: req.body.userEmail, // 👈 নিশ্চিত করা হলো
       studioImage: req.body.studioImage || studio?.imageUrl || "",
       totalPrice: Number(req.body.totalPrice),
       status: "Pending",
@@ -199,6 +281,23 @@ app.get("/booking/my-bookings", async (req, res) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ message: "Failed to load bookings.", error: error.message });
+  }
+});
+
+app.patch("/booking/:id/confirm", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
+    const result = await bookingsCollection.findOneAndUpdate(
+      query,
+      { $set: { status: "Confirmed", updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    if (!result) return res.status(404).json({ message: "Booking not found." });
+    res.json({ message: "Booking confirmed successfully.", booking: result });
+  } catch (error) {
+    console.error("PATCH /booking/:id/confirm failed:", error);
+    res.status(500).json({ message: "Failed to confirm booking.", error: error.message });
   }
 });
 
