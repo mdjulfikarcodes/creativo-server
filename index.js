@@ -37,8 +37,11 @@ const connectedClient = await connectToMongoDB();
 const db = connectedClient.db(DB_NAME);
 const studiosCollection = db.collection("studio");
 const bookingsCollection = db.collection("booking");
+const newslettersCollection = db.collection("newsletter");
+const reviewsCollection = db.collection("reviews");
+const wishlistsCollection = db.collection("wishlist"); // 👈 নতুন কালেকশন
 
-/* ---------- AUTH MIDDLEWARE (JWT Verification via Cookie or Header) ---------- */
+/* ---------- AUTH MIDDLEWARE ---------- */
 const verifySession = async (req, res, next) => {
   try {
     let token = req.cookies?.token;
@@ -73,7 +76,7 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-/* ---------- AUTH ROUTES (HTTPOnly Cookie Set/Clear) ---------- */
+/* ---------- AUTH ROUTES ---------- */
 app.post("/auth/login", async (req, res) => {
   const { email, name, image, sub } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required." });
@@ -104,6 +107,100 @@ app.get("/auth/me", verifySession, (req, res) => {
   res.json({ user: req.user });
 });
 
+/* ---------- NEWSLETTER ---------- */
+app.post("/newsletter", async (req, res) => {
+  const { email } = req.body;
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ message: "Valid email is required." });
+  }
+
+  try {
+    const existing = await newslettersCollection.findOne({ email });
+    if (existing) {
+      return res.status(200).json({ message: "You are already subscribed!" });
+    }
+
+    await newslettersCollection.insertOne({ 
+      email, 
+      createdAt: new Date() 
+    });
+
+    res.status(201).json({ message: "Subscribed successfully!" });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to subscribe.", error: error.message });
+  }
+});
+
+/* ---------- WISHLIST (Saved Studios) ---------- */
+// 👇 ১. ফেভারিটে যোগ বা রিমুভ করা (Toggle)
+app.post("/wishlist", verifySession, async (req, res) => {
+  const { studioId } = req.body;
+  if (!studioId) return res.status(400).json({ message: "Studio ID is required." });
+
+  try {
+    const existing = await wishlistsCollection.findOne({
+      userEmail: req.user.email,
+      studioId: String(studioId),
+    });
+
+    if (existing) {
+      // আগে থেকে থাকলে রিমুভ করবে
+      await wishlistsCollection.deleteOne({ _id: existing._id });
+      return res.json({ message: "Removed from wishlist.", action: "removed" });
+    }
+
+    // না থাকলে যোগ করবে
+    await wishlistsCollection.insertOne({
+      userEmail: req.user.email,
+      studioId: String(studioId),
+      createdAt: new Date(),
+    });
+
+    res.status(201).json({ message: "Added to wishlist.", action: "added" });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to update wishlist.", error: error.message });
+  }
+});
+
+// 👇 ২. ইউজারের সব ফেভারিট স্টুডিওর লিস্ট আনা
+app.get("/wishlist", verifySession, async (req, res) => {
+  try {
+    const wishlist = await wishlistsCollection
+      .find({ userEmail: req.user.email })
+      .toArray();
+
+    const studioIds = wishlist.map((w) => w.studioId);
+
+    // স্টুডিও ডেটা আনা
+    const studios = await studiosCollection
+      .find({
+        $or: [
+          { _id: { $in: studioIds.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id)) } },
+          { id: { $in: studioIds } },
+        ],
+      })
+      .toArray();
+
+    res.json(studios);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to load wishlist.", error: error.message });
+  }
+});
+
+// 👇 ৩. নির্দিষ্ট স্টুডিও ফেভারিটে আছে কি না চেক করা
+app.get("/wishlist/:studioId", verifySession, async (req, res) => {
+  const { studioId } = req.params;
+  try {
+    const existing = await wishlistsCollection.findOne({
+      userEmail: req.user.email,
+      studioId: String(studioId),
+    });
+    res.json({ isWishlisted: Boolean(existing) });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to check wishlist.", error: error.message });
+  }
+});
+
 /* ---------- STUDIO ---------- */
 const STUDIO_REQUIRED_FIELDS = [
   "title", "category", "location", "overview",
@@ -132,17 +229,16 @@ function validateStudio(body) {
 }
 
 function normalizeStudio(body) {
-  // 👇 ইমেজ অ্যারে হ্যান্ডলিং
   let images = [];
   if (Array.isArray(body.images) && body.images.length > 0) {
     images = body.images.filter((url) => url && url.trim() !== "");
   } else if (body.imageUrl) {
-    images = [body.imageUrl]; // সিঙ্গেল ইমেজ থাকলে সেটিকেই অ্যারেতে রাখা
+    images = [body.imageUrl];
   }
 
   return {
     ...body,
-    images, // 👈 অ্যারে হিসেবে সেভ হবে
+    images,
     hourlyRate: Number(body.hourlyRate),
     securityDeposit: Number(body.securityDeposit),
     maxCapacity: Number(body.maxCapacity),
@@ -173,9 +269,9 @@ app.post("/studio", verifySession, async (req, res) => {
 
 app.get("/studio", async (req, res) => {
   try {
-    const { ownerEmail, category } = req.query;
+    const { ownerEmail, category, location, minPrice, maxPrice } = req.query;
     const query = {};
-    
+
     if (typeof ownerEmail === "string" && ownerEmail.trim() !== "") {
       query.$or = [{ ownerEmail }, { hostEmail: ownerEmail }];
     }
@@ -184,9 +280,18 @@ app.get("/studio", async (req, res) => {
       query.category = { $regex: new RegExp(category, "i") };
     }
 
+    if (typeof location === "string" && location.trim() !== "") {
+      query.location = { $regex: new RegExp(location, "i") };
+    }
+
+    if (minPrice || maxPrice) {
+      query.hourlyRate = {};
+      if (minPrice) query.hourlyRate.$gte = Number(minPrice);
+      if (maxPrice) query.hourlyRate.$lte = Number(maxPrice);
+    }
+
     const result = await studiosCollection.find(query).toArray();
     
-    // 👇 প্রতিটি স্টুডিওতে images অ্যারে নিশ্চিত করা (ফলব্যাক সহ)
     const formatted = result.map((s) => ({
       ...s,
       images: Array.isArray(s.images) && s.images.length > 0 
@@ -209,22 +314,18 @@ app.get("/studio/:id", async (req, res) => {
     const result = await studiosCollection.findOne(query);
     if (!result) return res.status(404).json({ message: "Studio not found." });
 
-    const reviewsList = await bookingsCollection
-      .find({
-        $or: [{ studioId: String(result._id) }, { studioId: result._id }],
-        "review.rating": { $exists: true },
-      })
-      .sort({ "review.createdAt": -1 })
+    const reviewsList = await reviewsCollection
+      .find({ studioId: String(result._id) })
+      .sort({ createdAt: -1 })
       .toArray();
 
-    const formattedReviews = reviewsList.map((b) => ({
-      user: b.userName || "Anonymous",
-      rating: b.review.rating,
-      comment: b.review.comment,
-      createdAt: b.review.createdAt,
+    const formattedReviews = reviewsList.map((r) => ({
+      user: r.userName || "Anonymous",
+      rating: r.rating,
+      comment: r.comment,
+      createdAt: r.createdAt,
     }));
 
-    // 👇 সিঙ্গেল স্টুডিওর ক্ষেত্রেও images অ্যারে নিশ্চিত করা
     const images = Array.isArray(result.images) && result.images.length > 0
       ? result.images
       : result.imageUrl
@@ -253,7 +354,6 @@ app.patch("/studio/:id", verifySession, async (req, res) => {
     const updates = { updatedAt: new Date() };
     for (const key of Object.keys(req.body)) { updates[key] = req.body[key]; }
 
-    // 👇 আপডেটেও images অ্যারে নিশ্চিত করা
     if (req.body.images || req.body.imageUrl) {
       const images = Array.isArray(req.body.images) && req.body.images.length > 0
         ? req.body.images.filter((url) => url && url.trim() !== "")
@@ -353,25 +453,22 @@ app.post("/booking/:id/review", verifySession, async (req, res) => {
     if (!booking) return res.status(404).json({ message: "Booking not found." });
     if (booking.userEmail !== req.user.email) return res.status(403).json({ message: "Unauthorized to review this booking." });
     if (booking.status !== "Completed") return res.status(400).json({ message: "You can only review completed bookings." });
-    if (booking.review) return res.status(400).json({ message: "You have already reviewed this booking." });
 
-    await bookingsCollection.updateOne(query, { 
-      $set: { 
-        review: { 
-          rating: Number(rating), 
-          comment: comment.trim(), 
-          createdAt: new Date() 
-        },
-        updatedAt: new Date()
-      } 
+    const existingReview = await reviewsCollection.findOne({ bookingId: String(booking._id) });
+    if (existingReview) return res.status(400).json({ message: "You have already reviewed this booking." });
+
+    await reviewsCollection.insertOne({
+      bookingId: String(booking._id),
+      studioId: String(booking.studioId),
+      userEmail: req.user.email,
+      userName: req.user.name || "Anonymous",
+      rating: Number(rating),
+      comment: comment.trim(),
+      createdAt: new Date(),
     });
     
-    const allReviews = await bookingsCollection.find({ 
-      $or: [{ studioId: String(booking.studioId) }, { studioId: booking.studioId }], 
-      "review.rating": { $exists: true } 
-    }).toArray();
-    
-    const avgRating = allReviews.reduce((acc, curr) => acc + curr.review.rating, 0) / allReviews.length;
+    const allReviews = await reviewsCollection.find({ studioId: String(booking.studioId) }).toArray();
+    const avgRating = allReviews.reduce((acc, curr) => acc + curr.rating, 0) / allReviews.length;
     
     const studioQuery = ObjectId.isValid(booking.studioId) 
       ? { $or: [{ _id: new ObjectId(booking.studioId) }, { id: booking.studioId }] } 
@@ -454,7 +551,7 @@ app.get("/", (req, res) => res.send("Hello World!"));
 
 app.use((req, res) => res.status(404).json({ message: `Route ${req.method} ${req.originalUrl} not found.` }));
 
-app.use((err, req, res, next) => {
+app.use((err, res, next) => {
   console.error("Unhandled error:", err);
   if (res.headersSent) return next(err);
   res.status(500).json({ message: "Internal server error.", error: err.message });
