@@ -38,11 +38,14 @@ const db = connectedClient.db(DB_NAME);
 const studiosCollection = db.collection("studio");
 const bookingsCollection = db.collection("booking");
 
-/* ---------- AUTH MIDDLEWARE (JWT Verification) ---------- */
+/* ---------- AUTH MIDDLEWARE (JWT Verification via Cookie or Header) ---------- */
 const verifySession = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+    let token = req.cookies?.token;
+    if (!token) {
+      const authHeader = req.headers.authorization;
+      token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+    }
 
     if (!token) {
       return res.status(401).json({ message: "Unauthorized. No token provided." });
@@ -69,6 +72,37 @@ const verifySession = async (req, res, next) => {
     res.status(401).json({ message: "Unauthorized. Invalid or expired token." });
   }
 };
+
+/* ---------- AUTH ROUTES (HTTPOnly Cookie Set/Clear) ---------- */
+app.post("/auth/login", async (req, res) => {
+  const { email, name, image, sub } = req.body;
+  if (!email) return res.status(400).json({ message: "Email is required." });
+
+  const payload = { email, name, image, sub: sub || email };
+  const token = jwt.sign(payload, process.env.BETTER_AUTH_SECRET, {
+    algorithm: "HS256",
+    expiresIn: "7d",
+  });
+
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: "/",
+  });
+
+  res.json({ message: "Logged in successfully.", user: payload });
+});
+
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("token", { path: "/" });
+  res.json({ message: "Logged out successfully." });
+});
+
+app.get("/auth/me", verifySession, (req, res) => {
+  res.json({ user: req.user });
+});
 
 /* ---------- STUDIO ---------- */
 const STUDIO_REQUIRED_FIELDS = [
@@ -98,8 +132,17 @@ function validateStudio(body) {
 }
 
 function normalizeStudio(body) {
+  // 👇 ইমেজ অ্যারে হ্যান্ডলিং
+  let images = [];
+  if (Array.isArray(body.images) && body.images.length > 0) {
+    images = body.images.filter((url) => url && url.trim() !== "");
+  } else if (body.imageUrl) {
+    images = [body.imageUrl]; // সিঙ্গেল ইমেজ থাকলে সেটিকেই অ্যারেতে রাখা
+  }
+
   return {
     ...body,
+    images, // 👈 অ্যারে হিসেবে সেভ হবে
     hourlyRate: Number(body.hourlyRate),
     securityDeposit: Number(body.securityDeposit),
     maxCapacity: Number(body.maxCapacity),
@@ -142,7 +185,18 @@ app.get("/studio", async (req, res) => {
     }
 
     const result = await studiosCollection.find(query).toArray();
-    res.json(result);
+    
+    // 👇 প্রতিটি স্টুডিওতে images অ্যারে নিশ্চিত করা (ফলব্যাক সহ)
+    const formatted = result.map((s) => ({
+      ...s,
+      images: Array.isArray(s.images) && s.images.length > 0 
+        ? s.images 
+        : s.imageUrl 
+          ? [s.imageUrl] 
+          : [],
+    }));
+
+    res.json(formatted);
   } catch (error) {
     res.status(500).json({ message: "Failed to load studios.", error: error.message });
   }
@@ -170,8 +224,16 @@ app.get("/studio/:id", async (req, res) => {
       createdAt: b.review.createdAt,
     }));
 
+    // 👇 সিঙ্গেল স্টুডিওর ক্ষেত্রেও images অ্যারে নিশ্চিত করা
+    const images = Array.isArray(result.images) && result.images.length > 0
+      ? result.images
+      : result.imageUrl
+        ? [result.imageUrl]
+        : [];
+
     res.json({ 
       ...result, 
+      images, 
       rating: result.rating || null,
       reviews: formattedReviews.length > 0 ? formattedReviews.length : 0,
       reviewList: formattedReviews 
@@ -190,6 +252,16 @@ app.patch("/studio/:id", verifySession, async (req, res) => {
 
     const updates = { updatedAt: new Date() };
     for (const key of Object.keys(req.body)) { updates[key] = req.body[key]; }
+
+    // 👇 আপডেটেও images অ্যারে নিশ্চিত করা
+    if (req.body.images || req.body.imageUrl) {
+      const images = Array.isArray(req.body.images) && req.body.images.length > 0
+        ? req.body.images.filter((url) => url && url.trim() !== "")
+        : req.body.imageUrl
+          ? [req.body.imageUrl]
+          : existing.images || [];
+      updates.images = images;
+    }
     
     const result = await studiosCollection.findOneAndUpdate(query, { $set: updates }, { returnDocument: "after" });
     res.json({ message: "Studio updated successfully.", studio: result });
@@ -215,7 +287,6 @@ app.post("/booking", verifySession, async (req, res) => {
   try {
     const { studioId, date, startTime, endTime } = req.body;
 
-    // 👇 ১. বেসিক ভ্যালিডেশন
     if (!studioId || !date || !startTime || !endTime) {
       return res.status(400).json({ message: "Missing required booking fields." });
     }
@@ -223,13 +294,12 @@ app.post("/booking", verifySession, async (req, res) => {
       return res.status(400).json({ message: "Start time must be before end time." });
     }
 
-    // 👇 ২. Double-Booking Prevention (Pending + Confirmed চেক)
     const conflict = await bookingsCollection.findOne({
       $or: [{ studioId: String(studioId) }, { studioId }],
       date: date,
-      status: { $in: ["Pending", "Confirmed"] }, // Pending এবং Confirmed বুকিং চেক
-      startTime: { $lt: endTime }, // নতুন শুরুর সময় < পুরোনো শেষের সময়
-      endTime: { $gt: startTime }, // নতুন শেষের সময় > পুরোনো শুরুর সময়
+      status: { $in: ["Pending", "Confirmed"] },
+      startTime: { $lt: endTime },
+      endTime: { $gt: startTime },
     });
 
     if (conflict) {
@@ -238,14 +308,12 @@ app.post("/booking", verifySession, async (req, res) => {
       });
     }
 
-    // 👇 ৩. স্টুডিও তথ্য
     const studio = await studiosCollection.findOne(
       ObjectId.isValid(studioId)
         ? { $or: [{ _id: new ObjectId(studioId) }, { id: studioId }] }
         : { id: studioId }
     );
 
-    // 👇 ৪. নতুন বুকিং তৈরি
     const booking = {
       ...req.body,
       userEmail: req.user.email,
@@ -267,7 +335,6 @@ app.post("/booking", verifySession, async (req, res) => {
   }
 });
 
-// 👇 বুকিং শেষে রিভিউ সেভ করা
 app.post("/booking/:id/review", verifySession, async (req, res) => {
   const { id } = req.params;
   const { rating, comment } = req.body;
@@ -294,7 +361,8 @@ app.post("/booking/:id/review", verifySession, async (req, res) => {
           rating: Number(rating), 
           comment: comment.trim(), 
           createdAt: new Date() 
-        } 
+        },
+        updatedAt: new Date()
       } 
     });
     
@@ -337,7 +405,11 @@ app.patch("/booking/:id/confirm", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Confirmed", updatedAt: new Date() } }, { returnDocument: "after" });
+    const result = await bookingsCollection.findOneAndUpdate(
+      query, 
+      { $set: { status: "Confirmed", updatedAt: new Date() } }, 
+      { returnDocument: "after" }
+    );
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking confirmed successfully.", booking: result });
   } catch (error) {
@@ -349,7 +421,11 @@ app.patch("/booking/:id/cancel", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Cancelled", updatedAt: new Date() } }, { returnDocument: "after" });
+    const result = await bookingsCollection.findOneAndUpdate(
+      query, 
+      { $set: { status: "Cancelled", updatedAt: new Date() } }, 
+      { returnDocument: "after" }
+    );
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking cancelled successfully.", booking: result });
   } catch (error) {
@@ -361,7 +437,11 @@ app.patch("/booking/:id/complete", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Completed", updatedAt: new Date() } }, { returnDocument: "after" });
+    const result = await bookingsCollection.findOneAndUpdate(
+      query, 
+      { $set: { status: "Completed", updatedAt: new Date() } }, 
+      { returnDocument: "after" }
+    );
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking completed successfully.", booking: result });
   } catch (error) {
@@ -371,7 +451,9 @@ app.patch("/booking/:id/complete", verifySession, async (req, res) => {
 
 /* ---------- HEALTH / 404 / ERROR ---------- */
 app.get("/", (req, res) => res.send("Hello World!"));
+
 app.use((req, res) => res.status(404).json({ message: `Route ${req.method} ${req.originalUrl} not found.` }));
+
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   if (res.headersSent) return next(err);
