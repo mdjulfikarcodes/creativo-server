@@ -39,7 +39,7 @@ const studiosCollection = db.collection("studio");
 const bookingsCollection = db.collection("booking");
 const newslettersCollection = db.collection("newsletter");
 const reviewsCollection = db.collection("reviews");
-const wishlistsCollection = db.collection("wishlist"); // 👈 নতুন কালেকশন
+const wishlistsCollection = db.collection("wishlist");
 
 /* ---------- AUTH MIDDLEWARE ---------- */
 const verifySession = async (req, res, next) => {
@@ -120,19 +120,14 @@ app.post("/newsletter", async (req, res) => {
       return res.status(200).json({ message: "You are already subscribed!" });
     }
 
-    await newslettersCollection.insertOne({ 
-      email, 
-      createdAt: new Date() 
-    });
-
+    await newslettersCollection.insertOne({ email, createdAt: new Date() });
     res.status(201).json({ message: "Subscribed successfully!" });
   } catch (error) {
     res.status(500).json({ message: "Failed to subscribe.", error: error.message });
   }
 });
 
-/* ---------- WISHLIST (Saved Studios) ---------- */
-// 👇 ১. ফেভারিটে যোগ বা রিমুভ করা (Toggle)
+/* ---------- WISHLIST ---------- */
 app.post("/wishlist", verifySession, async (req, res) => {
   const { studioId } = req.body;
   if (!studioId) return res.status(400).json({ message: "Studio ID is required." });
@@ -144,12 +139,10 @@ app.post("/wishlist", verifySession, async (req, res) => {
     });
 
     if (existing) {
-      // আগে থেকে থাকলে রিমুভ করবে
       await wishlistsCollection.deleteOne({ _id: existing._id });
       return res.json({ message: "Removed from wishlist.", action: "removed" });
     }
 
-    // না থাকলে যোগ করবে
     await wishlistsCollection.insertOne({
       userEmail: req.user.email,
       studioId: String(studioId),
@@ -162,32 +155,27 @@ app.post("/wishlist", verifySession, async (req, res) => {
   }
 });
 
-// 👇 ২. ইউজারের সব ফেভারিট স্টুডিওর লিস্ট আনা
 app.get("/wishlist", verifySession, async (req, res) => {
   try {
-    const wishlist = await wishlistsCollection
-      .find({ userEmail: req.user.email })
-      .toArray();
+    const wishlist = await wishlistsCollection.find({ userEmail: req.user.email }).toArray();
+    if (wishlist.length === 0) return res.json([]);
 
     const studioIds = wishlist.map((w) => w.studioId);
+    const objectIds = studioIds.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
 
-    // স্টুডিও ডেটা আনা
-    const studios = await studiosCollection
-      .find({
-        $or: [
-          { _id: { $in: studioIds.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id)) } },
-          { id: { $in: studioIds } },
-        ],
-      })
-      .toArray();
+    const studios = await studiosCollection.find({
+      $or: [{ _id: { $in: objectIds } }, { id: { $in: studioIds } }],
+    }).toArray();
 
-    res.json(studios);
+    res.json(studios.map((s) => ({
+      ...s,
+      images: Array.isArray(s.images) && s.images.length > 0 ? s.images : s.imageUrl ? [s.imageUrl] : [],
+    })));
   } catch (error) {
     res.status(500).json({ message: "Failed to load wishlist.", error: error.message });
   }
 });
 
-// 👇 ৩. নির্দিষ্ট স্টুডিও ফেভারিটে আছে কি না চেক করা
 app.get("/wishlist/:studioId", verifySession, async (req, res) => {
   const { studioId } = req.params;
   try {
@@ -202,10 +190,7 @@ app.get("/wishlist/:studioId", verifySession, async (req, res) => {
 });
 
 /* ---------- STUDIO ---------- */
-const STUDIO_REQUIRED_FIELDS = [
-  "title", "category", "location", "overview",
-  "hourlyRate", "securityDeposit", "maxCapacity", "imageUrl",
-];
+const STUDIO_REQUIRED_FIELDS = ["title", "category", "location", "overview", "hourlyRate", "securityDeposit", "maxCapacity", "imageUrl"];
 const STUDIO_NUMERIC_FIELDS = ["hourlyRate", "securityDeposit", "maxCapacity"];
 
 function validateStudio(body) {
@@ -269,39 +254,34 @@ app.post("/studio", verifySession, async (req, res) => {
 
 app.get("/studio", async (req, res) => {
   try {
-    const { ownerEmail, category, location, minPrice, maxPrice } = req.query;
+    const { ownerEmail, category, location, minPrice, maxPrice, minCapacity, maxCapacity } = req.query;
     const query = {};
 
     if (typeof ownerEmail === "string" && ownerEmail.trim() !== "") {
       query.$or = [{ ownerEmail }, { hostEmail: ownerEmail }];
     }
-
     if (typeof category === "string" && category.trim() !== "") {
       query.category = { $regex: new RegExp(category, "i") };
     }
-
     if (typeof location === "string" && location.trim() !== "") {
       query.location = { $regex: new RegExp(location, "i") };
     }
-
     if (minPrice || maxPrice) {
       query.hourlyRate = {};
       if (minPrice) query.hourlyRate.$gte = Number(minPrice);
       if (maxPrice) query.hourlyRate.$lte = Number(maxPrice);
     }
+    if (minCapacity || maxCapacity) {
+      query.maxCapacity = {};
+      if (minCapacity) query.maxCapacity.$gte = Number(minCapacity);
+      if (maxCapacity) query.maxCapacity.$lte = Number(maxCapacity);
+    }
 
     const result = await studiosCollection.find(query).toArray();
-    
-    const formatted = result.map((s) => ({
+    res.json(result.map((s) => ({
       ...s,
-      images: Array.isArray(s.images) && s.images.length > 0 
-        ? s.images 
-        : s.imageUrl 
-          ? [s.imageUrl] 
-          : [],
-    }));
-
-    res.json(formatted);
+      images: Array.isArray(s.images) && s.images.length > 0 ? s.images : s.imageUrl ? [s.imageUrl] : [],
+    })));
   } catch (error) {
     res.status(500).json({ message: "Failed to load studios.", error: error.message });
   }
@@ -314,11 +294,7 @@ app.get("/studio/:id", async (req, res) => {
     const result = await studiosCollection.findOne(query);
     if (!result) return res.status(404).json({ message: "Studio not found." });
 
-    const reviewsList = await reviewsCollection
-      .find({ studioId: String(result._id) })
-      .sort({ createdAt: -1 })
-      .toArray();
-
+    const reviewsList = await reviewsCollection.find({ studioId: String(result._id) }).sort({ createdAt: -1 }).toArray();
     const formattedReviews = reviewsList.map((r) => ({
       user: r.userName || "Anonymous",
       rating: r.rating,
@@ -326,21 +302,68 @@ app.get("/studio/:id", async (req, res) => {
       createdAt: r.createdAt,
     }));
 
-    const images = Array.isArray(result.images) && result.images.length > 0
-      ? result.images
-      : result.imageUrl
-        ? [result.imageUrl]
-        : [];
+    const images = Array.isArray(result.images) && result.images.length > 0 ? result.images : result.imageUrl ? [result.imageUrl] : [];
 
-    res.json({ 
-      ...result, 
-      images, 
+    res.json({
+      ...result,
+      images,
       rating: result.rating || null,
-      reviews: formattedReviews.length > 0 ? formattedReviews.length : 0,
-      reviewList: formattedReviews 
+      reviews: formattedReviews.length,
+      reviewList: formattedReviews,
     });
   } catch (error) {
     res.status(500).json({ message: "Failed to load studio.", error: error.message });
+  }
+});
+
+// 👇 রিভিউ জমা দেওয়ার সঠিক রুট (স্টুডিও আইডি দিয়ে)
+app.post("/studio/:id/review", verifySession, async (req, res) => {
+  const { id } = req.params;
+  const { rating, comment } = req.body;
+
+  if (!rating || Number(rating) < 1 || Number(rating) > 5) {
+    return res.status(400).json({ message: "Rating must be between 1 and 5." });
+  }
+  if (!comment || comment.trim() === "") {
+    return res.status(400).json({ message: "Comment is required." });
+  }
+
+  try {
+    const studioQuery = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
+    const studio = await studiosCollection.findOne(studioQuery);
+    if (!studio) return res.status(404).json({ message: "Studio not found." });
+
+    const booking = await bookingsCollection.findOne({
+      $or: [{ studioId: String(studio._id) }, { studioId: studio._id }],
+      userEmail: req.user.email,
+      status: "Completed",
+    });
+
+    if (!booking) return res.status(403).json({ message: "You must complete a booking to review this studio." });
+
+    const existingReview = await reviewsCollection.findOne({ bookingId: String(booking._id) });
+    if (existingReview) return res.status(400).json({ message: "You have already reviewed this booking." });
+
+    await reviewsCollection.insertOne({
+      bookingId: String(booking._id),
+      studioId: String(studio._id),
+      userEmail: req.user.email,
+      userName: req.user.name || "Anonymous",
+      rating: Number(rating),
+      comment: comment.trim(),
+      createdAt: new Date(),
+    });
+
+    const allReviews = await reviewsCollection.find({ studioId: String(studio._id) }).toArray();
+    const avgRating = allReviews.reduce((acc, curr) => acc + curr.rating, 0) / allReviews.length;
+
+    await studiosCollection.updateOne(studioQuery, {
+      $set: { rating: Number(avgRating.toFixed(1)), reviews: allReviews.length },
+    });
+
+    res.status(201).json({ message: "Review added successfully." });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to add review.", error: error.message });
   }
 });
 
@@ -357,9 +380,7 @@ app.patch("/studio/:id", verifySession, async (req, res) => {
     if (req.body.images || req.body.imageUrl) {
       const images = Array.isArray(req.body.images) && req.body.images.length > 0
         ? req.body.images.filter((url) => url && url.trim() !== "")
-        : req.body.imageUrl
-          ? [req.body.imageUrl]
-          : existing.images || [];
+        : req.body.imageUrl ? [req.body.imageUrl] : existing.images || [];
       updates.images = images;
     }
     
@@ -403,15 +424,11 @@ app.post("/booking", verifySession, async (req, res) => {
     });
 
     if (conflict) {
-      return res.status(409).json({ 
-        message: "This time slot is already booked. Please choose another time." 
-      });
+      return res.status(409).json({ message: "This time slot is already booked. Please choose another time." });
     }
 
     const studio = await studiosCollection.findOne(
-      ObjectId.isValid(studioId)
-        ? { $or: [{ _id: new ObjectId(studioId) }, { id: studioId }] }
-        : { id: studioId }
+      ObjectId.isValid(studioId) ? { $or: [{ _id: new ObjectId(studioId) }, { id: studioId }] } : { id: studioId }
     );
 
     const booking = {
@@ -426,64 +443,9 @@ app.post("/booking", verifySession, async (req, res) => {
     };
 
     const result = await bookingsCollection.insertOne(booking);
-    res.status(201).json({ 
-      message: "Booking created successfully.", 
-      booking: { ...booking, _id: result.insertedId } 
-    });
+    res.status(201).json({ message: "Booking created successfully.", booking: { ...booking, _id: result.insertedId } });
   } catch (error) {
     res.status(500).json({ message: "Failed to create booking.", error: error.message });
-  }
-});
-
-app.post("/booking/:id/review", verifySession, async (req, res) => {
-  const { id } = req.params;
-  const { rating, comment } = req.body;
-  
-  if (!rating || Number(rating) < 1 || Number(rating) > 5) {
-    return res.status(400).json({ message: "Rating must be between 1 and 5." });
-  }
-  if (!comment || comment.trim() === "") {
-    return res.status(400).json({ message: "Comment is required." });
-  }
-
-  try {
-    const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const booking = await bookingsCollection.findOne(query);
-    
-    if (!booking) return res.status(404).json({ message: "Booking not found." });
-    if (booking.userEmail !== req.user.email) return res.status(403).json({ message: "Unauthorized to review this booking." });
-    if (booking.status !== "Completed") return res.status(400).json({ message: "You can only review completed bookings." });
-
-    const existingReview = await reviewsCollection.findOne({ bookingId: String(booking._id) });
-    if (existingReview) return res.status(400).json({ message: "You have already reviewed this booking." });
-
-    await reviewsCollection.insertOne({
-      bookingId: String(booking._id),
-      studioId: String(booking.studioId),
-      userEmail: req.user.email,
-      userName: req.user.name || "Anonymous",
-      rating: Number(rating),
-      comment: comment.trim(),
-      createdAt: new Date(),
-    });
-    
-    const allReviews = await reviewsCollection.find({ studioId: String(booking.studioId) }).toArray();
-    const avgRating = allReviews.reduce((acc, curr) => acc + curr.rating, 0) / allReviews.length;
-    
-    const studioQuery = ObjectId.isValid(booking.studioId) 
-      ? { $or: [{ _id: new ObjectId(booking.studioId) }, { id: booking.studioId }] } 
-      : { id: booking.studioId };
-      
-    await studiosCollection.updateOne(studioQuery, {
-      $set: { 
-        rating: Number(avgRating.toFixed(1)), 
-        reviews: allReviews.length 
-      }
-    });
-
-    res.json({ message: "Review added successfully." });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to add review.", error: error.message });
   }
 });
 
@@ -502,11 +464,7 @@ app.patch("/booking/:id/confirm", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(
-      query, 
-      { $set: { status: "Confirmed", updatedAt: new Date() } }, 
-      { returnDocument: "after" }
-    );
+    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Confirmed", updatedAt: new Date() } }, { returnDocument: "after" });
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking confirmed successfully.", booking: result });
   } catch (error) {
@@ -518,11 +476,7 @@ app.patch("/booking/:id/cancel", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(
-      query, 
-      { $set: { status: "Cancelled", updatedAt: new Date() } }, 
-      { returnDocument: "after" }
-    );
+    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Cancelled", updatedAt: new Date() } }, { returnDocument: "after" });
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking cancelled successfully.", booking: result });
   } catch (error) {
@@ -534,11 +488,7 @@ app.patch("/booking/:id/complete", verifySession, async (req, res) => {
   const { id } = req.params;
   try {
     const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
-    const result = await bookingsCollection.findOneAndUpdate(
-      query, 
-      { $set: { status: "Completed", updatedAt: new Date() } }, 
-      { returnDocument: "after" }
-    );
+    const result = await bookingsCollection.findOneAndUpdate(query, { $set: { status: "Completed", updatedAt: new Date() } }, { returnDocument: "after" });
     if (!result) return res.status(404).json({ message: "Booking not found." });
     res.json({ message: "Booking completed successfully.", booking: result });
   } catch (error) {
@@ -551,7 +501,7 @@ app.get("/", (req, res) => res.send("Hello World!"));
 
 app.use((req, res) => res.status(404).json({ message: `Route ${req.method} ${req.originalUrl} not found.` }));
 
-app.use((err, res, next) => {
+app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   if (res.headersSent) return next(err);
   res.status(500).json({ message: "Internal server error.", error: err.message });
