@@ -25,10 +25,10 @@ const client = new MongoClient(process.env.MONGO_URI);
 async function connectToMongoDB() {
   try {
     await client.connect();
-    console.log("✅ Connected to MongoDB");
+    console.log("Connected to MongoDB");
     return client;
   } catch (err) {
-    console.error("❌ MongoDB connection failed:", err);
+    console.error("MongoDB connection failed:", err);
     process.exit(1);
   }
 }
@@ -316,7 +316,7 @@ app.get("/studio/:id", async (req, res) => {
   }
 });
 
-// 👇 রিভিউ জমা দেওয়ার সঠিক রুট (স্টুডিও আইডি দিয়ে)
+
 app.post("/studio/:id/review", verifySession, async (req, res) => {
   const { id } = req.params;
   const { rating, comment } = req.body;
@@ -507,4 +507,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "Internal server error.", error: err.message });
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
