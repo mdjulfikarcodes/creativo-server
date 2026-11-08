@@ -4,6 +4,10 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import { MongoClient, ObjectId } from "mongodb";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import axios from "axios";
+import FormData from "form-data";
+import { z } from "zod";
 import "dotenv/config";
 
 const PORT = process.env.PORT || 5000;
@@ -20,15 +24,17 @@ app.use(cors({ origin: CLIENT_ORIGINS, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
+const upload = multer({ storage: multer.memoryStorage() });
+
 const client = new MongoClient(process.env.MONGO_URI);
 
 async function connectToMongoDB() {
   try {
     await client.connect();
-    console.log("Connected to MongoDB");
+    console.log("✅ Connected to MongoDB");
     return client;
   } catch (err) {
-    console.error("MongoDB connection failed:", err);
+    console.error("❌ MongoDB connection failed:", err);
     process.exit(1);
   }
 }
@@ -40,6 +46,37 @@ const bookingsCollection = db.collection("booking");
 const newslettersCollection = db.collection("newsletter");
 const reviewsCollection = db.collection("reviews");
 const wishlistsCollection = db.collection("wishlist");
+
+/* ---------- ZOD SCHEMAS ---------- */
+const StudioSchema = z.object({
+  title: z.string().min(5),
+  category: z.string().min(1),
+  location: z.string().min(3),
+  overview: z.string().min(10),
+  hourlyRate: z.number().positive(),
+  securityDeposit: z.number().nonnegative(),
+  maxCapacity: z.number().positive(),
+  imageUrl: z.string().url(),
+  amenities: z.array(z.string()).min(1),
+  images: z.array(z.string().url()).optional(),
+});
+
+const BookingSchema = z.object({
+  studioId: z.string().min(1),
+  date: z.string().min(1),
+  startTime: z.string().min(1),
+  endTime: z.string().min(1),
+  totalPrice: z.number().positive(),
+});
+
+const ReviewSchema = z.object({
+  rating: z.number().min(1).max(5),
+  comment: z.string().min(2),
+});
+
+const WishlistSchema = z.object({
+  studioId: z.string().min(1),
+});
 
 /* ---------- AUTH MIDDLEWARE ---------- */
 const verifySession = async (req, res, next) => {
@@ -107,6 +144,33 @@ app.get("/auth/me", verifySession, (req, res) => {
   res.json({ user: req.user });
 });
 
+/* ---------- IMAGE UPLOAD (ImgBB) ---------- */
+app.post("/upload", verifySession, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No image file provided." });
+    }
+
+    const formData = new FormData();
+    formData.append("image", req.file.buffer.toString("base64"));
+
+    const imgbbRes = await axios.post(
+      `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+      formData,
+      { headers: formData.getHeaders() }
+    );
+
+    if (imgbbRes.data && imgbbRes.data.data) {
+      return res.status(200).json({ url: imgbbRes.data.data.url });
+    } else {
+      throw new Error("Invalid ImgBB response");
+    }
+  } catch (error) {
+    console.error("Image upload failed:", error.message);
+    res.status(500).json({ message: "Failed to upload image.", error: error.message });
+  }
+});
+
 /* ---------- NEWSLETTER ---------- */
 app.post("/newsletter", async (req, res) => {
   const { email } = req.body;
@@ -129,8 +193,12 @@ app.post("/newsletter", async (req, res) => {
 
 /* ---------- WISHLIST ---------- */
 app.post("/wishlist", verifySession, async (req, res) => {
-  const { studioId } = req.body;
-  if (!studioId) return res.status(400).json({ message: "Studio ID is required." });
+  const parsed = WishlistSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid data", errors: parsed.error.errors });
+  }
+
+  const { studioId } = parsed.data;
 
   try {
     const existing = await wishlistsCollection.findOne({
@@ -190,71 +258,46 @@ app.get("/wishlist/:studioId", verifySession, async (req, res) => {
 });
 
 /* ---------- STUDIO ---------- */
-const STUDIO_REQUIRED_FIELDS = ["title", "category", "location", "overview", "hourlyRate", "securityDeposit", "maxCapacity", "imageUrl"];
-const STUDIO_NUMERIC_FIELDS = ["hourlyRate", "securityDeposit", "maxCapacity"];
-
-function validateStudio(body) {
-  const errors = {};
-  for (const field of STUDIO_REQUIRED_FIELDS) {
-    const value = body?.[field];
-    if (value === undefined || value === null || String(value).trim() === "") {
-      errors[field] = `${field} is required.`;
-    }
-  }
-  for (const field of STUDIO_NUMERIC_FIELDS) {
-    const value = body?.[field];
-    if (value !== undefined && value !== null && String(value).trim() !== "" && !Number.isFinite(Number(value))) {
-      errors[field] = `${field} must be a number.`;
-    }
-  }
-  if (!Array.isArray(body?.amenities) || body.amenities.length === 0) {
-    errors.amenities = "Select at least one amenity.";
-  }
-  return errors;
-}
-
-function normalizeStudio(body) {
-  let images = [];
-  if (Array.isArray(body.images) && body.images.length > 0) {
-    images = body.images.filter((url) => url && url.trim() !== "");
-  } else if (body.imageUrl) {
-    images = [body.imageUrl];
-  }
-
-  return {
-    ...body,
-    images,
-    hourlyRate: Number(body.hourlyRate),
-    securityDeposit: Number(body.securityDeposit),
-    maxCapacity: Number(body.maxCapacity),
-    rating: body.rating ? Number(body.rating) : null,
-    reviews: 0,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  };
-}
-
 app.post("/studio", verifySession, async (req, res) => {
-  const errors = validateStudio(req.body);
-  if (Object.keys(errors).length > 0) {
-    return res.status(400).json({ message: `Invalid studio data: ${Object.values(errors).join(" ")}`, errors });
+  const parsed = StudioSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid studio data", errors: parsed.error.errors });
   }
-  try {
-    const studio = normalizeStudio(req.body);
-    studio.ownerEmail = req.user.email;
-    studio.hostEmail = req.user.email;
-    studio.hostName = req.user.name;
 
-    const result = await studiosCollection.insertOne(studio);
-    res.status(201).json({ message: "Studio created successfully.", studio: { ...studio, _id: result.insertedId } });
+  try {
+    const studio = parsed.data;
+    
+    let images = [];
+    if (Array.isArray(studio.images) && studio.images.length > 0) {
+      images = studio.images;
+    } else if (studio.imageUrl) {
+      images = [studio.imageUrl];
+    }
+
+    const newStudio = {
+      ...studio,
+      images,
+      rating: null,
+      reviews: 0,
+      ownerEmail: req.user.email,
+      hostEmail: req.user.email,
+      hostName: req.user.name,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await studiosCollection.insertOne(newStudio);
+    res.status(201).json({ message: "Studio created successfully.", studio: { ...newStudio, _id: result.insertedId } });
   } catch (error) {
     res.status(500).json({ message: "Failed to create studio.", error: error.message });
   }
 });
 
+// 👇 Explore পেজের জন্য limit বাড়িয়ে 1000 করা হলো
 app.get("/studio", async (req, res) => {
   try {
-    const { ownerEmail, category, location, minPrice, maxPrice, minCapacity, maxCapacity } = req.query;
+    const { ownerEmail, category, location, minPrice, maxPrice, minCapacity, maxCapacity, page = 1, limit = 1000 } = req.query;
+    
     const query = {};
 
     if (typeof ownerEmail === "string" && ownerEmail.trim() !== "") {
@@ -277,11 +320,26 @@ app.get("/studio", async (req, res) => {
       if (maxCapacity) query.maxCapacity.$lte = Number(maxCapacity);
     }
 
-    const result = await studiosCollection.find(query).toArray();
-    res.json(result.map((s) => ({
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = parseInt(limit, 10) || 1000;
+    const skip = (pageNum - 1) * limitNum;
+
+    const totalStudios = await studiosCollection.countDocuments(query);
+    const totalPages = Math.ceil(totalStudios / limitNum);
+
+    const result = await studiosCollection.find(query).skip(skip).limit(limitNum).toArray();
+    
+    const formatted = result.map((s) => ({
       ...s,
       images: Array.isArray(s.images) && s.images.length > 0 ? s.images : s.imageUrl ? [s.imageUrl] : [],
-    })));
+    }));
+
+    res.json({
+      studios: formatted,
+      totalPages,
+      currentPage: pageNum,
+      totalStudios
+    });
   } catch (error) {
     res.status(500).json({ message: "Failed to load studios.", error: error.message });
   }
@@ -316,17 +374,14 @@ app.get("/studio/:id", async (req, res) => {
   }
 });
 
-
 app.post("/studio/:id/review", verifySession, async (req, res) => {
-  const { id } = req.params;
-  const { rating, comment } = req.body;
+  const parsed = ReviewSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid review data", errors: parsed.error.errors });
+  }
 
-  if (!rating || Number(rating) < 1 || Number(rating) > 5) {
-    return res.status(400).json({ message: "Rating must be between 1 and 5." });
-  }
-  if (!comment || comment.trim() === "") {
-    return res.status(400).json({ message: "Comment is required." });
-  }
+  const { rating, comment } = parsed.data;
+  const { id } = req.params;
 
   try {
     const studioQuery = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
@@ -336,10 +391,12 @@ app.post("/studio/:id/review", verifySession, async (req, res) => {
     const booking = await bookingsCollection.findOne({
       $or: [{ studioId: String(studio._id) }, { studioId: studio._id }],
       userEmail: req.user.email,
-      status: "Completed",
+      status: { $in: ["Completed", "Confirmed"] },
     });
 
-    if (!booking) return res.status(403).json({ message: "You must complete a booking to review this studio." });
+    if (!booking) {
+      return res.status(403).json({ message: "You must have a confirmed or completed booking to review this studio." });
+    }
 
     const existingReview = await reviewsCollection.findOne({ bookingId: String(booking._id) });
     if (existingReview) return res.status(400).json({ message: "You have already reviewed this booking." });
@@ -374,6 +431,10 @@ app.patch("/studio/:id", verifySession, async (req, res) => {
     const existing = await studiosCollection.findOne(query);
     if (!existing) return res.status(404).json({ message: "Studio not found." });
 
+    if (existing.ownerEmail !== req.user.email && existing.hostEmail !== req.user.email) {
+      return res.status(403).json({ message: "Unauthorized to edit this studio." });
+    }
+
     const updates = { updatedAt: new Date() };
     for (const key of Object.keys(req.body)) { updates[key] = req.body[key]; }
 
@@ -395,6 +456,13 @@ app.delete("/studio/:id", verifySession, async (req, res) => {
   const { id } = req.params;
   const query = ObjectId.isValid(id) ? { $or: [{ _id: new ObjectId(id) }, { id }] } : { id };
   try {
+    const existing = await studiosCollection.findOne(query);
+    if (!existing) return res.status(404).json({ message: "Studio not found." });
+
+    if (existing.ownerEmail !== req.user.email && existing.hostEmail !== req.user.email) {
+      return res.status(403).json({ message: "Unauthorized to delete this studio." });
+    }
+
     const result = await studiosCollection.findOneAndDelete(query);
     if (!result) return res.status(404).json({ message: "Studio not found." });
     res.json({ message: "Studio deleted successfully.", deletedId: id });
@@ -405,12 +473,14 @@ app.delete("/studio/:id", verifySession, async (req, res) => {
 
 /* ---------- BOOKING ---------- */
 app.post("/booking", verifySession, async (req, res) => {
-  try {
-    const { studioId, date, startTime, endTime } = req.body;
+  const parsed = BookingSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid booking data", errors: parsed.error.errors });
+  }
 
-    if (!studioId || !date || !startTime || !endTime) {
-      return res.status(400).json({ message: "Missing required booking fields." });
-    }
+  const { studioId, date, startTime, endTime, totalPrice } = parsed.data;
+
+  try {
     if (startTime >= endTime) {
       return res.status(400).json({ message: "Start time must be before end time." });
     }
@@ -436,7 +506,7 @@ app.post("/booking", verifySession, async (req, res) => {
       userEmail: req.user.email,
       userName: req.user.name,
       studioImage: req.body.studioImage || studio?.imageUrl || "",
-      totalPrice: Number(req.body.totalPrice),
+      totalPrice: Number(totalPrice),
       status: "Pending",
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -507,4 +577,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "Internal server error.", error: err.message });
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
